@@ -1,0 +1,112 @@
+import numpy as np 
+import Exeter_CFD_Problems as TestSuite
+from sklearn.gaussian_process import GaussianProcessRegressor 
+import matplotlib.pyplot as plt
+from scipy.stats import norm
+
+import os
+
+def acquisition(model, X, n_samples, mode):
+
+    # get the mean and stdev from the model
+    pred, stdev = model.predict(X, return_std=True)
+
+    # calculate the expected improvement
+    if mode == 'ei':
+        # return the top n_samples from X that have the highest expected improvement
+
+        # calculate the expected improvement
+        best = np.max(pred)
+        score = abs(stdev * (pred - best)) #change to more complex version of expected improvement function (?)
+        # z = (pred - best)/ stdev
+        # score = (pred - best) * norm.cdf(z) + stdev * norm.cdf(z) #possible better function?
+
+        top_n_samples = np.argsort(score)[-n_samples:] 
+    
+    if mode == 'ga':
+        #return top n samples with highest predicted value
+
+        top_n_samples = np.argsort(pred)[-n_samples:]
+
+        for i in range(0, len(top_n_samples)):
+            index = top_n_samples[i]
+            print(pred[index])
+
+
+    else:
+        raise NotImplementedError
+
+
+    return top_n_samples
+
+
+#set up case according to GitHub instructions
+settings = {}
+settings['source_case'] = 'Exeter_CFD_Problems/data/PitzDaily/case_fine/' # source directory
+settings['case_path'] = 'Exeter_CFD_Problems/data/PitzDaily/case_single/' # case path where CFD simulations will run
+settings['boundary_files'] = ['Exeter_CFD_Problems/data/PitzDaily/boundary.csv']
+settings['fixed_points_files'] = ['Exeter_CFD_Problems/data/PitzDaily/fixed.csv']
+settings['n_control'] = [1] 
+
+prob = TestSuite.PitzDaily(settings)
+lb, ub = prob.get_decision_boundary() # lb = lower bounds, ub = upper bounds
+
+features_array = np.loadtxt('features_updated.txt') #training data - geometries
+targets_array = np.loadtxt('targets_updated.txt') #training data - final velocities
+decision_vectors = np.loadtxt('decision_vectors_new.txt') #bank of 250,000 valid geometries
+
+gaussian = GaussianProcessRegressor()
+
+iterations = 0
+
+
+
+while iterations < 50:
+
+    print('checking array shapes: ', features_array.shape, targets_array.shape)
+
+    #train gaussian regression model on existing training data
+    gaussian_model = gaussian.fit(features_array, targets_array)
+
+
+    #call function to find new features to evaluate
+    new_samples = acquisition(gaussian_model, decision_vectors, 10, mode='ga') 
+
+    print('new samples =', new_samples)
+    
+    #simulate each new sample in turn
+    for i in range(0,10):
+        print('running sample ', (i+1), ' of 10')
+        x = new_samples[i]
+        try:
+            res = prob.evaluate(decision_vectors[x], verbose=True) #run CFD simulation
+        #ignore 
+        except TypeError: #skip past error thrown when simulation reaches steady state (?)
+            pass
+
+        #create, run, and load in postProcessing scripts in new simulation directory
+        os.system("cp sampleDict Exeter_CFD_Problems/data/PitzDaily/case_single/system/")
+        os.system("(cd Exeter_CFD_Problems/data/PitzDaily/case_single/; postProcess -func sampleDict)")
+
+        xvelocity_data = np.loadtxt('Exeter_CFD_Problems/data/PitzDaily/case_single/postProcessing/sampleDict/0/outlet_U.xy', dtype=float,usecols = 1)
+        try:
+            #find max velocity at outlet
+            max_xvelocity = np.max(xvelocity_data) 
+            print('max velocity = ',max_xvelocity)
+
+            #update training dataset with new simulations
+            features_array = np.vstack((features_array,decision_vectors[x]))
+            targets_array = np.append(targets_array, max_xvelocity)
+
+        
+            
+            print('iterations =', iterations )
+        except ValueError: #roughly 1 in 50 sims returned nan velocities, not sure why - skip past
+            pass
+    iterations += 1
+
+    #update training data files for future sim convenience
+    np.savetxt('features_updated.txt', features_array)
+    np.savetxt('targets_updated.txt', targets_array)
+
+print('Iteration limit reached')
